@@ -1,0 +1,153 @@
+name: Build & Publish
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      service-path:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+      BREVO_API_KEY:
+        required: false
+    outputs:
+      image_tag:
+        description: "The Docker image tag that was generated"
+        value: ${{ jobs.build-publish.outputs.image_tag }}
+      built:
+        description: "true if a new image was actually built"
+        value: ${{ jobs.build-publish.outputs.built }}
+
+jobs:
+  build-publish:
+    name: "Build & Publish - ${{ inputs.service-name }}"
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      built: ${{ steps.build.outputs.built }}
+    concurrency:
+      group: build-publish-${{ inputs.service-name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate semantic version
+        id: semver
+        if: inputs.environment == 'main'
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ github.token }}
+          tag_prefix: ${{ inputs.service-name }}-v
+          dry_run: true
+          default_bump: patch
+
+      - name: Generate tag
+        id: tag
+        run: |
+          if [ "${{ inputs.environment }}" = "main" ]; then
+            echo "tag=${{ steps.semver.outputs.new_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=dev-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate tag uniqueness
+        id: tag_check
+        run: |
+          git fetch --tags origin || true
+          TAG=${{ steps.tag.outputs.tag }}
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            TAG_COMMIT=$(git rev-list -n 1 "$TAG")
+            [ "$TAG_COMMIT" != "$(git rev-parse HEAD)" ] && echo "Tag exists on a different commit!" && exit 1
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Check if image already exists
+        id: image_check
+        run: |
+          if docker manifest inspect ${{ secrets.DOCKER_USERNAME }}/${{ inputs.service-name }}:${{ steps.tag.outputs.tag }} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Docker image
+        id: build
+        if: steps.image_check.outputs.exists != 'true'
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/${{ inputs.service-name }}:${{ steps.tag.outputs.tag }} .
+          echo "built=true" >> $GITHUB_OUTPUT
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@master
+        if: steps.build.outputs.built == 'true'
+        with:
+          image-ref: "${{ secrets.DOCKER_USERNAME }}/${{ inputs.service-name }}:${{ steps.tag.outputs.tag }}"
+          format: "table"
+          output: "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"
+          scan-type: "image"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.build.outputs.built == 'true'
+        with:
+          name: trivy-${{ inputs.service-name }}
+          path: "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"
+          retention-days: 14
+
+      - name: Check Trivy for critical findings
+        id: trivy-check
+        if: steps.build.outputs.built == 'true'
+        run: |
+          if grep -q "CRITICAL" "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"; then
+            echo "critical_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "critical_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Alert via Brevo
+        if: steps.trivy-check.outputs.critical_found == 'true'
+        run: |
+          REPORT_BASE64=$(base64 -w 0 "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt")
+          cat > /tmp/payload.json << EOF
+          {
+            "sender": {"name": "CI Pipeline", "email": "fitforge360.in@gmail.com"},
+            "to": [{"email": "fitforge360.in@gmail.com"}],
+            "subject": "Trivy critical findings — ${{ inputs.service-name }}",
+            "textContent": "Critical/high Trivy findings. See attachment.",
+            "attachment": [{"name": "trivy-report.txt", "content": "$REPORT_BASE64"}]
+          }
+          EOF
+          curl --request POST \
+            --url https://api.brevo.com/v3/smtp/email \
+            --header "api-key: $BREVO_API_KEY" \
+            --header "content-type: application/json" \
+            --data @/tmp/payload.json
+        env:
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+      - name: Push Docker image
+        if: steps.build.outputs.built == 'true' && github.event_name != 'pull_request'
+        run: docker push ${{ secrets.DOCKER_USERNAME }}/${{ inputs.service-name }}:${{ steps.tag.outputs.tag }}
