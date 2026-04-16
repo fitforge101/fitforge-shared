@@ -1,0 +1,45 @@
+name: Tag Release
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      service-path:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+
+jobs:
+  tag-release:
+    name: "Tag Release - ${{ inputs.service-name }}"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if tag already exists
+        id: tag_check
+        run: |
+          git fetch --tags origin || true
+          if git rev-parse "${{ inputs.image_tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Git tag
+        if: steps.tag_check.outputs.exists != 'true'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git tag ${{ inputs.image_tag }}
+          git push origin ${{ inputs.image_tag }}

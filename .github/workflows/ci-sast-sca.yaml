@@ -1,0 +1,146 @@
+name: SAST + SCA
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      service-path:
+        required: true
+        type: string
+      runtime:
+        required: false
+        type: string
+        default: "node"
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      python-version:
+        required: false
+        type: string
+        default: "3.11"
+    secrets:
+      SNYK_TOKEN:
+        required: true
+      SONAR_TOKEN:
+        required: true
+      SONAR_URL:
+        required: true
+      BREVO_API_KEY:
+        required: false
+    outputs:
+      snyk_critical:
+        description: "true if high/critical vulnerabilities were found"
+        value: ${{ jobs.code-quality.outputs.snyk_critical }}
+
+jobs:
+  code-quality:
+    name: "Code Quality - ${{ inputs.service-name }}"
+    runs-on: ubuntu-latest
+    outputs:
+      snyk_critical: ${{ steps.snyk-check.outputs.critical_found }}
+    concurrency:
+      group: code-quality-${{ inputs.service-name }}-${{ github.ref }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sonar scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        with:
+          projectBaseDir: ${{ inputs.service-path }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_URL }}
+
+      - name: Sonar quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        with:
+          scanMetadataReportFile: ${{ inputs.service-path }}/.scannerwork/report-task.txt
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        if: inputs.runtime == 'node'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "npm"
+          cache-dependency-path: "${{ inputs.service-path }}/package-lock.json"
+
+      - uses: actions/setup-python@v5
+        if: inputs.runtime == 'python'
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: "pip"
+
+      - name: Install Node dependencies
+        if: inputs.runtime == 'node'
+        run: npm ci
+
+      - name: Check unused dependencies
+        if: inputs.runtime == 'node'
+        run: npx depcheck || true
+
+      - name: Install Python dependencies
+        if: inputs.runtime == 'python'
+        run: pip install -r requirements.txt
+
+      - uses: snyk/actions/setup@master
+
+      - name: Install snyk-to-html
+        run: npm install -g snyk-to-html
+
+      - name: Snyk scan (Node)
+        if: inputs.runtime == 'node'
+        run: snyk test --severity-threshold=high --json-file-output=snyk-report.json || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk scan (Python)
+        if: inputs.runtime == 'python'
+        run: snyk test --file=requirements.txt --package-manager=pip --severity-threshold=high --json-file-output=snyk-report.json || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Convert Snyk report to HTML
+        run: snyk-to-html -i snyk-report.json -o snyk-report.html
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-report-${{ inputs.service-name }}
+          path: ${{ inputs.service-path }}/snyk-report.html
+          retention-days: 14
+
+      - name: Check for critical vulnerabilities
+        id: snyk-check
+        run: |
+          COUNT=$(jq '[.vulnerabilities[] | select(.severity == "critical" or .severity == "high")] | length' snyk-report.json)
+          echo "critical_found=$([ "$COUNT" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Alert via Brevo
+        if: steps.snyk-check.outputs.critical_found == 'true'
+        run: |
+          REPORT_BASE64=$(base64 -w 0 snyk-report.html)
+          curl --request POST \
+            --url https://api.brevo.com/v3/smtp/email \
+            --header "api-key: $BREVO_API_KEY" \
+            --header "content-type: application/json" \
+            --data "{
+              \"sender\": {\"name\": \"CI Pipeline\", \"email\": \"fitforge360.in@gmail.com\"},
+              \"to\": [{\"email\": \"fitforge360.in@gmail.com\"}],
+              \"subject\": \"Critical vulnerabilities — ${{ inputs.service-name }}\",
+              \"textContent\": \"Critical/high Snyk findings. See attachment.\",
+              \"attachment\": [{\"name\": \"snyk-report.html\", \"content\": \"$REPORT_BASE64\"}]
+            }"
+        env:
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}

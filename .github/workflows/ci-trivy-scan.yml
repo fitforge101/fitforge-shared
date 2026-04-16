@@ -1,0 +1,88 @@
+name: Trivy Scan
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+      artifact_name:
+        required: true
+        type: string
+    secrets:
+      BREVO_API_KEY:
+        required: false
+    outputs:
+      critical_found:
+        description: "true if critical/high vulnerabilities were found"
+        value: ${{ jobs.trivy-scan.outputs.critical_found }}
+
+jobs:
+  trivy-scan:
+    name: "Trivy Scan - ${{ inputs.service-name }}"
+    runs-on: ubuntu-latest
+    outputs:
+      critical_found: ${{ steps.trivy-check.outputs.critical_found }}
+
+    steps:
+      - name: Download image tar artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: /tmp
+
+      - name: Load image into Docker
+        run: docker load -i /tmp/image.tar
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ inputs.image_tag }}"
+          format: "table"
+          output: "${{ github.workspace }}/trivy-report.txt"
+          scan-type: "image"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report-${{ inputs.service-name }}
+          path: "${{ github.workspace }}/trivy-report.txt"
+          retention-days: 14
+
+      - name: Check for critical findings
+        id: trivy-check
+        run: |
+          if grep -q "CRITICAL" "${{ github.workspace }}/trivy-report.txt"; then
+            echo "critical_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "critical_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Alert via Brevo
+        if: steps.trivy-check.outputs.critical_found == 'true'
+        run: |
+          REPORT_BASE64=$(base64 -w 0 "${{ github.workspace }}/trivy-report.txt")
+          cat > /tmp/payload.json << EOF
+          {
+            "sender": {"name": "CI Pipeline", "email": "fitforge360.in@gmail.com"},
+            "to": [{"email": "fitforge360.in@gmail.com"}],
+            "subject": "Trivy critical findings — ${{ inputs.service-name }}",
+            "textContent": "Critical/high Trivy findings in ${{ inputs.service-name }}. See attachment.",
+            "attachment": [{"name": "trivy-report.txt", "content": "$REPORT_BASE64"}]
+          }
+          EOF
+          curl --request POST \
+            --url https://api.brevo.com/v3/smtp/email \
+            --header "api-key: $BREVO_API_KEY" \
+            --header "content-type: application/json" \
+            --data @/tmp/payload.json
+        env:
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}

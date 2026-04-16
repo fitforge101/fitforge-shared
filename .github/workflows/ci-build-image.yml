@@ -1,0 +1,115 @@
+name: Build Image
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      service-path:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+    outputs:
+      image_tag:
+        description: "The generated Docker image tag"
+        value: ${{ jobs.build-image.outputs.image_tag }}
+      artifact_name:
+        description: "The GitHub artifact name containing the image tar"
+        value: ${{ jobs.build-image.outputs.artifact_name }}
+      already_exists:
+        description: "true if this tag was already built and pushed previously"
+        value: ${{ jobs.build-image.outputs.already_exists }}
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+
+jobs:
+  build-image:
+    name: "Build Image - ${{ inputs.service-name }}"
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      artifact_name: ${{ steps.artifact.outputs.name }}
+      already_exists: ${{ steps.image_check.outputs.exists }}
+    concurrency:
+      group: build-image-${{ inputs.service-name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate semantic version
+        id: semver
+        if: inputs.environment == 'main'
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ github.token }}
+          tag_prefix: ${{ inputs.service-name }}-v
+          dry_run: true
+          default_bump: patch
+
+      - name: Generate tag
+        id: tag
+        run: |
+          if [ "${{ inputs.environment }}" = "main" ]; then
+            echo "tag=${{ steps.semver.outputs.new_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=dev-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate tag uniqueness
+        run: |
+          git fetch --tags origin || true
+          TAG=${{ steps.tag.outputs.tag }}
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            TAG_COMMIT=$(git rev-list -n 1 "$TAG")
+            [ "$TAG_COMMIT" != "$(git rev-parse HEAD)" ] && echo "Tag exists on a different commit!" && exit 1
+          fi
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Check if image already exists in registry
+        id: image_check
+        run: |
+          if docker manifest inspect ${{ secrets.DOCKER_USERNAME }}/${{ inputs.service-name }}:${{ steps.tag.outputs.tag }} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Docker image
+        if: steps.image_check.outputs.exists != 'true'
+        run: |
+          docker build \
+            -t ${{ secrets.DOCKER_USERNAME }}/${{ inputs.service-name }}:${{ steps.tag.outputs.tag }} \
+            .
+
+      - name: Save image as tar
+        if: steps.image_check.outputs.exists != 'true'
+        run: |
+          docker save \
+            ${{ secrets.DOCKER_USERNAME }}/${{ inputs.service-name }}:${{ steps.tag.outputs.tag }} \
+            -o /tmp/image.tar
+
+      - name: Set artifact name
+        id: artifact
+        run: echo "name=docker-image-${{ inputs.service-name }}-${{ steps.tag.outputs.tag }}" >> $GITHUB_OUTPUT
+
+      - name: Upload image tar artifact
+        if: steps.image_check.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: /tmp/image.tar
+          retention-days: 1
