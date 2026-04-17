@@ -66,5 +66,5 @@ jobs:
             echo "No changes detected in values.yaml (tag might already be up to date)"
           else
             git commit -m "cd: update ${{ inputs.service-name }} image tag to ${{ inputs.image-tag }} [${{ inputs.environment }}]"
-            git push origin main
+            git push origin ${{ inputs.environment }}
           fi
