@@ -31,6 +31,7 @@ jobs:
           repository: fitforge101/fitforge-charts
           token: ${{ secrets.HELM_REPO_PAT }}
           path: charts
+          ref: ${{ inputs.environment }}
 
       - name: Setup yq
         uses: mikefarah/yq@v4.44.1
