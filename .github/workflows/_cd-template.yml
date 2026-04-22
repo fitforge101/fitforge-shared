@@ -38,11 +38,11 @@ jobs:
 
       - name: Update image tag
         run: |
-          FILE="charts/microservices/${{ inputs.service-name }}/values.yaml"
+          FILE="charts/microservices/values.yaml"
           if [ -f "$FILE" ]; then
             echo "Updating $FILE with tag ${{ inputs.image-tag }}"
             # Update the tag value. Ensure it's treated as a string to preserve formatting.
-            yq -i ".image.tag = \"${{ inputs.image-tag }}\"" "$FILE"
+            yq -i ".services.\"${{ inputs.service-name }}\".image.tag = \"${{ inputs.image-tag }}\"" "$FILE"
           else
             echo "::error::File not found: $FILE (Is your service-name correct?)"
             exit 1
@@ -51,7 +51,7 @@ jobs:
       - name: Validate values.yaml
         run: |
           # Ensure the YAML is still valid after modification
-          yq eval '.' "charts/microservices/${{ inputs.service-name }}/values.yaml" > /dev/null
+          yq eval '.' "charts/microservices/values.yaml" > /dev/null
 
       - name: Commit and Push changes
         run: |
@@ -60,7 +60,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           # Stage the specific values file
-          git add microservices/${{ inputs.service-name }}/values.yaml
+          git add microservices/values.yaml
           
           if git diff --staged --quiet; then
             echo "No changes detected in values.yaml (tag might already be up to date)"
